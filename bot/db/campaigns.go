@@ -37,6 +37,13 @@ type Campaign struct {
 	// window. Empty means the offer reaches only those inside it.
 	TemplateName string `json:"template_name"`
 	TemplateLang string `json:"template_lang"`
+	// A retry is sent only to the contacts campaign RetryOf failed to reach.
+	RetryOf int `json:"retry_of"`
+	// The most contacts the paid template may go to; 0 means as many as
+	// Meta's daily limit has left.
+	MaxPaid int `json:"max_paid"`
+	// Nil for campaigns sent before delivery was tracked.
+	Delivery *DeliveryCounts `json:"delivery"`
 }
 
 type QuizResponseDetail struct {
@@ -88,15 +95,15 @@ func CreateCampaign(c Campaign) (int, error) {
 
 	query := `INSERT INTO campaigns
 		(type, question, option_a, option_b, option_c, correct_answer, explanation, youtube_link, image_url, caption, scheduled_at, buttons,
-		 template_name, template_lang)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,NULLIF($13, ''),NULLIF($14, ''))
+		 template_name, template_lang, retry_of, max_paid)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,NULLIF($13, ''),NULLIF($14, ''),NULLIF($15, 0),NULLIF($16, 0))
 		RETURNING id`
 	var id int
 	err := Pool.QueryRow(context.Background(), query,
 		c.Type, c.Question, c.OptionA, c.OptionB, c.OptionC,
 		c.CorrectAnswer, c.Explanation, c.YouTubeLink,
 		c.ImageURL, c.Caption, c.ScheduledAt, buttons,
-		c.TemplateName, c.TemplateLang,
+		c.TemplateName, c.TemplateLang, c.RetryOf, c.MaxPaid,
 	).Scan(&id)
 	return id, err
 }
@@ -106,7 +113,8 @@ func GetAllCampaigns() ([]Campaign, error) {
 	rows, err := Pool.Query(context.Background(),
 		`SELECT id, type, question, option_a, option_b, option_c, correct_answer, explanation,
 		        youtube_link, image_url, caption, scheduled_at, status, total_sent, created_at,
-		        COALESCE(buttons, '[]'::jsonb), COALESCE(template_name, ''), COALESCE(template_lang, '')
+		        COALESCE(buttons, '[]'::jsonb), COALESCE(template_name, ''), COALESCE(template_lang, ''),
+		        COALESCE(retry_of, 0), COALESCE(max_paid, 0)
 		 FROM campaigns ORDER BY scheduled_at DESC`)
 	if err != nil {
 		return nil, err
@@ -120,7 +128,7 @@ func GetAllCampaigns() ([]Campaign, error) {
 		err := rows.Scan(&c.ID, &c.Type, &c.Question, &c.OptionA, &c.OptionB, &c.OptionC,
 			&c.CorrectAnswer, &c.Explanation, &c.YouTubeLink, &c.ImageURL, &c.Caption,
 			&c.ScheduledAt, &c.Status, &c.TotalSent, &c.CreatedAt, &rawButtons,
-			&c.TemplateName, &c.TemplateLang)
+			&c.TemplateName, &c.TemplateLang, &c.RetryOf, &c.MaxPaid)
 		if err != nil {
 			// Silently dropping the row hid a whole page of campaigns behind a
 			// 200 with an empty list. Skipping is still the right recovery, but
@@ -134,12 +142,33 @@ func GetAllCampaigns() ([]Campaign, error) {
 	return campaigns, nil
 }
 
+// GetCampaign returns one campaign by ID.
+func GetCampaign(id int) (Campaign, error) {
+	var c Campaign
+	var rawButtons []byte
+	err := Pool.QueryRow(context.Background(),
+		`SELECT id, type, question, option_a, option_b, option_c, correct_answer, explanation,
+		        youtube_link, image_url, caption, scheduled_at, status, total_sent, created_at,
+		        COALESCE(buttons, '[]'::jsonb), COALESCE(template_name, ''), COALESCE(template_lang, ''),
+		        COALESCE(retry_of, 0), COALESCE(max_paid, 0)
+		 FROM campaigns WHERE id = $1`, id).Scan(&c.ID, &c.Type, &c.Question, &c.OptionA, &c.OptionB, &c.OptionC,
+		&c.CorrectAnswer, &c.Explanation, &c.YouTubeLink, &c.ImageURL, &c.Caption,
+		&c.ScheduledAt, &c.Status, &c.TotalSent, &c.CreatedAt, &rawButtons,
+		&c.TemplateName, &c.TemplateLang, &c.RetryOf, &c.MaxPaid)
+	if err != nil {
+		return c, err
+	}
+	c.Buttons = decodeButtons(c.ID, rawButtons)
+	return c, nil
+}
+
 // GetDueCampaigns returns scheduled campaigns whose time has arrived.
 func GetDueCampaigns() ([]Campaign, error) {
 	rows, err := Pool.Query(context.Background(),
 		`SELECT id, type, question, option_a, option_b, option_c, correct_answer, explanation,
 		        youtube_link, image_url, caption, scheduled_at, status, total_sent, created_at,
-		        COALESCE(buttons, '[]'::jsonb), COALESCE(template_name, ''), COALESCE(template_lang, '')
+		        COALESCE(buttons, '[]'::jsonb), COALESCE(template_name, ''), COALESCE(template_lang, ''),
+		        COALESCE(retry_of, 0), COALESCE(max_paid, 0)
 		 FROM campaigns WHERE status = 'scheduled' AND scheduled_at <= NOW()`)
 	if err != nil {
 		return nil, err
@@ -153,7 +182,7 @@ func GetDueCampaigns() ([]Campaign, error) {
 		rows.Scan(&c.ID, &c.Type, &c.Question, &c.OptionA, &c.OptionB, &c.OptionC,
 			&c.CorrectAnswer, &c.Explanation, &c.YouTubeLink, &c.ImageURL, &c.Caption,
 			&c.ScheduledAt, &c.Status, &c.TotalSent, &c.CreatedAt, &rawButtons,
-			&c.TemplateName, &c.TemplateLang)
+			&c.TemplateName, &c.TemplateLang, &c.RetryOf, &c.MaxPaid)
 		c.Buttons = decodeButtons(c.ID, rawButtons)
 		campaigns = append(campaigns, c)
 	}
@@ -250,7 +279,8 @@ func GetCampaignAnalytics(campaignID int) (CampaignAnalytics, error) {
 func GetCampaignsPaginated(limit, offset int, start, end string) ([]Campaign, error) {
 	query := `SELECT id, type, question, option_a, option_b, option_c, correct_answer, explanation,
 		        youtube_link, image_url, caption, scheduled_at, status, total_sent, created_at,
-		        COALESCE(buttons, '[]'::jsonb), COALESCE(template_name, ''), COALESCE(template_lang, '')
+		        COALESCE(buttons, '[]'::jsonb), COALESCE(template_name, ''), COALESCE(template_lang, ''),
+		        COALESCE(retry_of, 0), COALESCE(max_paid, 0)
 		 FROM campaigns WHERE 1=1`
 	args := []interface{}{}
 	argID := 1
@@ -282,7 +312,7 @@ func GetCampaignsPaginated(limit, offset int, start, end string) ([]Campaign, er
 		err := rows.Scan(&c.ID, &c.Type, &c.Question, &c.OptionA, &c.OptionB, &c.OptionC,
 			&c.CorrectAnswer, &c.Explanation, &c.YouTubeLink, &c.ImageURL, &c.Caption,
 			&c.ScheduledAt, &c.Status, &c.TotalSent, &c.CreatedAt, &rawButtons,
-			&c.TemplateName, &c.TemplateLang)
+			&c.TemplateName, &c.TemplateLang, &c.RetryOf, &c.MaxPaid)
 		if err != nil {
 			// Silently dropping the row hid a whole page of campaigns behind a
 			// 200 with an empty list. Skipping is still the right recovery, but

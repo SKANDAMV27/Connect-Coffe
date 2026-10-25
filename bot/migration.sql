@@ -187,3 +187,29 @@ CREATE TABLE IF NOT EXISTS offers (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- ── Broadcast delivery ──────────────────────────────────────────────────────
+-- One row per contact an offer went to. Meta accepting a send is not the
+-- same as delivering it: it can drop the message afterwards (error 131049,
+-- "healthy ecosystem engagement", took half of the first paid broadcast), and
+-- it says so only in a status webhook, matched back here on wa_msg_id.
+CREATE TABLE IF NOT EXISTS campaign_recipients (
+    id SERIAL PRIMARY KEY,
+    campaign_id INT NOT NULL REFERENCES campaigns(id),
+    phone VARCHAR NOT NULL,
+    channel VARCHAR NOT NULL,            -- 'free' (24h window) or 'template' (paid)
+    wa_msg_id VARCHAR UNIQUE,            -- NULL when Meta refused the send outright
+    status VARCHAR NOT NULL,             -- sent | delivered | read | failed | skipped
+    error_code INT,
+    error TEXT,
+    sent_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_campaign_recipients_campaign ON campaign_recipients (campaign_id, status);
+
+-- A retry goes only to the contacts the campaign it points at failed to reach.
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS retry_of INT REFERENCES campaigns(id);
+
+-- The most contacts the paid template may go to, chosen in the composer.
+-- NULL means as many as Meta's daily limit has left.
+ALTER TABLE campaigns ADD COLUMN IF NOT EXISTS max_paid INT;

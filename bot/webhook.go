@@ -100,9 +100,12 @@ type WebhookRequest struct {
 					ID     string `json:"id"`
 					Status string `json:"status"`
 					Errors []struct {
-						Code    int    `json:"code"`
-						Title   string `json:"title"`
-						Message string `json:"message"`
+						Code      int    `json:"code"`
+						Title     string `json:"title"`
+						Message   string `json:"message"`
+						ErrorData struct {
+							Details string `json:"details"`
+						} `json:"error_data"`
 					} `json:"errors,omitempty"`
 				} `json:"statuses,omitempty"`
 			} `json:"value"`
@@ -215,16 +218,30 @@ func WebhookHandler(w http.ResponseWriter, r *http.Request) {
 					}
 				}
 
-				// 3. Process delivery statuses
+				// 3. Process delivery statuses. Broadcast sends are matched
+				// back to their recipient row for the delivery report.
 				for _, status := range change.Value.Statuses {
+					code, reason := 0, ""
 					if status.Status == "failed" && len(status.Errors) > 0 {
 						errStr := ""
 						for _, e := range status.Errors {
 							errStr += e.Message + " "
 						}
 						log.Printf("⚠️ [Webhook] Message Delivery FAILED (ID: %s) - Reason: %s", status.ID, errStr)
-					} else {
-						// log.Printf("[Webhook] Message %s status: %s", status.ID, status.Status)
+						e := status.Errors[0]
+						code, reason = e.Code, e.Message
+						if reason == "" {
+							reason = e.ErrorData.Details
+						}
+						if reason == "" {
+							reason = e.Title
+						}
+					}
+					switch status.Status {
+					case "sent", "delivered", "read", "failed":
+						if err := db.UpdateRecipientStatus(status.ID, status.Status, code, reason); err != nil {
+							log.Printf("[Webhook] Could not record status %s for %s: %v", status.Status, status.ID, err)
+						}
 					}
 				}
 			}

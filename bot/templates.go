@@ -215,7 +215,7 @@ func checkTemplateActions(actions []string, quick int) string {
 // An image header carries the offer's photo. Quick-reply buttons carry the
 // given actions in order as their payloads, so a tap does what that action
 // does anywhere else in the bot.
-func sendTemplate(to string, t MetaTemplate, imageURL string, actions []string) bool {
+func sendTemplate(to string, t MetaTemplate, imageURL string, actions []string) metaResult {
 	payload := map[string]interface{}{
 		"messaging_product": "whatsapp",
 		"recipient_type":    "individual",
@@ -227,7 +227,7 @@ func sendTemplate(to string, t MetaTemplate, imageURL string, actions []string) 
 	if c, ok := t.component("BODY"); ok {
 		body = c.Text
 	}
-	return sendToMeta(payload, to, "[Template: "+t.Name+"] "+body)
+	return sendToMetaResult(payload, to, "[Template: "+t.Name+"] "+body)
 }
 
 // templateMessage is the "template" object of a send: the template's name and
