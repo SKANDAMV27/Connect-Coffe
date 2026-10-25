@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { format, parseISO } from 'date-fns';
 import {
   AlertCircle,
@@ -7,6 +7,7 @@ import {
   Megaphone,
   Plus,
   Send,
+  FileBarChart,
   Trash2,
   X,
 } from 'lucide-react';
@@ -18,6 +19,8 @@ import {
   uploadImage,
   getContacts,
   getWhatsAppTemplates,
+  getMessagingLimit,
+  getBilling,
 } from '../api';
 import { BUTTON_ACTIONS, actionLabel, guessAction } from '../lib/buttonActions';
 import { getBroadcastStatus } from '../lib/broadcastStatus';
@@ -27,6 +30,10 @@ import PageHeader from '../components/PageHeader';
 import Modal from '../components/Modal';
 import ConfirmModal from '../components/ConfirmModal';
 import WhatsAppPreview, { FormattingHint } from '../components/WhatsAppPreview';
+import DeliveryReport from '../components/DeliveryReport';
+import OfferContacts from '../components/OfferContacts';
+import WhatsAppBalance from '../components/WhatsAppBalance';
+import { rupees } from '../lib/money';
 import { Reveal } from '../components/motion/Reveal';
 import { Button } from '../components/ui/button';
 import { Badge } from '../components/ui/badge';
@@ -204,6 +211,11 @@ const headline = (campaign) =>
   (campaign.caption || '').split('\n').find((l) => l.trim())?.replace(/[*_~`]/g, '').trim() ||
   'Offer';
 
+const QUALITY = { GREEN: 'High', YELLOW: 'Medium', RED: 'Low' };
+
+/** How many more paid sends today's limit allows; Infinity when unlimited. */
+const paidLeftOf = (limit) => (!limit ? 0 : limit.left < 0 ? Infinity : limit.left);
+
 export default function Campaigns() {
   const [campaigns, setCampaigns] = useState([]);
   const [total, setTotal] = useState(0);
@@ -233,6 +245,14 @@ export default function Campaigns() {
 
   const [modal, setModal] = useState({ open: false, title: '', message: '', type: 'success' });
   const [confirmCancel, setConfirmCancel] = useState(null);
+
+  // Meta's paid-message limit: different people per 24 hours, and how many
+  // of those today has left. The bot holds back anyone past it.
+  const [limit, setLimit] = useState(null);
+  const [billing, setBilling] = useState(null); // spend, price and balance
+  const [maxPaid, setMaxPaid] = useState('');
+  const [report, setReport] = useState(null); // the offer whose delivery report is open
+  const [refreshKey, setRefreshKey] = useState(0); // reloads the contacts list
 
   // Uploads are served by the bot at /api/uploads; the bot rewrites the
   // address to its public one before handing it to Meta.
@@ -287,9 +307,40 @@ export default function Campaigns() {
     return () => clearInterval(interval);
   }, [inFlight, load]);
 
+  const loadLimit = useCallback(() => {
+    getMessagingLimit()
+      .then(({ data }) => setLimit(data))
+      .catch((err) => {
+        console.error(err);
+        setLimit(null);
+      });
+  }, []);
+
+  const loadBilling = useCallback((fresh = false) => {
+    getBilling(fresh)
+      .then(({ data }) => setBilling(data))
+      .catch((err) => {
+        console.error(err);
+        setBilling(null);
+      });
+  }, []);
+
   useEffect(() => {
     loadAudience();
-  }, [loadAudience]);
+    loadLimit();
+    loadBilling();
+  }, [loadAudience, loadLimit, loadBilling]);
+
+  // Once an offer finishes going out, the limit, spend and contacts change.
+  const wasInFlight = useRef(false);
+  useEffect(() => {
+    if (wasInFlight.current && !inFlight) {
+      loadLimit();
+      loadBilling(true);
+      setRefreshKey((k) => k + 1);
+    }
+    wasInFlight.current = inFlight;
+  }, [inFlight, loadLimit, loadBilling]);
 
   // Free the object URL behind an uploaded photo's preview.
   useEffect(() => () => localPreview && URL.revokeObjectURL(localPreview), [localPreview]);
@@ -306,9 +357,12 @@ export default function Campaigns() {
     setReach('free');
     setWaTemplateKey('');
     setFilledFrom('');
+    setMaxPaid('');
     if (template) applyTemplate(template);
     setComposerOpen(true);
     loadAudience();
+    loadLimit();
+    loadBilling();
   };
 
   const loadWaTemplates = useCallback(() => {
@@ -391,6 +445,16 @@ export default function Campaigns() {
     const problem = buttonProblem(form.buttons);
     if (problem) next.buttons = problem;
     if (reach === 'everyone' && !waTemplate) next.waTemplate = 'Choose the approved template to send to everyone else.';
+    if (reach === 'everyone' && maxPaid !== '') {
+      const n = Number(maxPaid);
+      if (!Number.isInteger(n) || n < 1) next.maxPaid = 'Enter a whole number, 1 or more.';
+      else if (n > paidLeftOf(limit)) next.maxPaid = `Today’s limit has only ${paidLeftOf(limit)} left.`;
+    }
+    if (paidPlan?.after != null && paidPlan.after < 0) {
+      next.maxPaid = `Not enough balance: up to ${rupees(paidPlan.cost)} needed, about ${rupees(
+        billing.balance_estimate,
+      )} left. Top up in WhatsApp Manager and update the balance, or send to fewer people.`;
+    }
     setErrors(next);
     return Object.keys(next).length === 0;
   };
@@ -419,6 +483,7 @@ export default function Campaigns() {
         buttons: form.buttons.map((b) => ({ id: b.id, title: b.title.trim() })),
         template_name: reach === 'everyone' ? waTemplate.name : '',
         template_lang: reach === 'everyone' ? waTemplate.language : '',
+        max_paid: reach === 'everyone' && maxPaid !== '' ? Number(maxPaid) : 0,
       });
 
       setComposerOpen(false);
@@ -468,11 +533,24 @@ export default function Campaigns() {
     }
   };
 
+  // The paid part of the offer if it went now: capped by the daily limit and
+  // the number chosen, and its cost if every one of them were delivered.
+  const paidPlan = useMemo(() => {
+    if (!audience || reach !== 'everyone') return null;
+    const need = audience.subscribed - audience.reachable;
+    const chosen = maxPaid !== '' ? Number(maxPaid) || 0 : Infinity;
+    const count = Math.max(0, Math.min(need, paidLeftOf(limit), chosen));
+    const cost = billing ? count * billing.rate : null;
+    const after = billing?.balance_estimate != null && cost != null ? billing.balance_estimate - cost : null;
+    return { need, count, held: need - count, cost, after };
+  }, [audience, reach, limit, maxPaid, billing]);
+
   const reachLine = useMemo(() => {
     if (audience === null) return 'The number of recipients could not be read just now.';
-    if (reach === 'everyone') {
-      const paid = audience.subscribed - audience.reachable;
-      return `Goes to all ${audience.subscribed} subscribed contacts: ${audience.reachable} free, and ${paid} as a paid template message, counted as of now.`;
+    if (reach === 'everyone' && paidPlan) {
+      return `${audience.reachable} free, and ${paidPlan.count} as a paid template${
+        paidPlan.cost != null ? ` (up to ${rupees(paidPlan.cost)})` : ''
+      }${paidPlan.held > 0 ? `; ${paidPlan.held} held back by the limit, for a retry later` : ''}. Counted as of now.`;
     }
     if (audience.reachable === 0) {
       return 'Right now nobody has messaged in the last 24 hours, so this would reach nobody.';
@@ -480,7 +558,7 @@ export default function Campaigns() {
     return `Goes free to ${audience.reachable} of ${audience.subscribed} subscribed ${
       audience.subscribed === 1 ? 'contact' : 'contacts'
     } — the ones who messaged in the last 24 hours.`;
-  }, [audience, reach]);
+  }, [audience, reach, paidPlan]);
 
   const previewCaption = form.caption.trim();
   const previewImage = uploadSource === 'local' ? localPreview : form.image_url.trim();
@@ -490,7 +568,7 @@ export default function Campaigns() {
       <PageHeader
         eyebrow="Marketing"
         title="Broadcasts"
-        intro="Send an offer — a photo, a few lines and buttons to tap — to everyone who messaged Connect in the last 24 hours. Inside that window WhatsApp delivers it for free."
+        intro="Send an offer — a photo, a few lines and buttons to tap. People who messaged Connect in the last 24 hours get it free; everyone else needs a paid template, within WhatsApp's daily limit."
         action={
           <Button onClick={() => openComposer()}>
             <Plus />
@@ -499,18 +577,78 @@ export default function Campaigns() {
         }
       />
 
-      <div className="mb-6 flex flex-wrap items-baseline gap-x-3 gap-y-1 rounded-xl border border-border bg-white px-4 py-3">
-        <p className="text-[13px] font-medium text-ink">
-          Reachable now, free:{' '}
-          <span className="tabular-nums text-primary">
-            {audience === null ? '—' : `${audience.reachable} of ${audience.subscribed}`}
-          </span>{' '}
-          subscribed contacts
-        </p>
-        <p className="text-[12px] leading-relaxed text-text-secondary">
-          Only people who messaged in the last 24 hours can receive an offer. Everyone else
-          would need a paid WhatsApp template.
-        </p>
+      <div className="mb-8 grid grid-cols-1 gap-3 lg:grid-cols-2 xl:grid-cols-[minmax(0,0.8fr)_minmax(0,1.2fr)_minmax(0,1.2fr)]">
+        <div className="rounded-xl border border-border bg-white px-5 py-4">
+          <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-text-secondary">Free now</p>
+          <p className="mt-1 font-heading text-2xl font-bold tabular-nums text-ink">
+            {audience === null ? '—' : audience.reachable}
+            <span className="ml-1.5 text-[13px] font-normal text-text-secondary">
+              of {audience === null ? '—' : audience.subscribed} subscribed
+            </span>
+          </p>
+          <p className="mt-1 text-[12px] leading-relaxed text-text-secondary">
+            Messaged in the last 24 hours, so an offer reaches them at no charge and does not count toward the limit.
+          </p>
+        </div>
+
+        <div className="rounded-xl border border-border bg-white px-5 py-4">
+          <div className="flex flex-wrap items-baseline justify-between gap-2">
+            <p className="text-[11px] font-medium uppercase tracking-[0.08em] text-text-secondary">
+              Paid marketing — WhatsApp limit
+            </p>
+            {limit?.quality && (
+              <p className="text-[12px] text-text-secondary">
+                Number quality:{' '}
+                <span className={limit.quality === 'GREEN' ? 'text-success' : limit.quality === 'RED' ? 'text-danger' : 'text-warning'}>
+                  {QUALITY[limit.quality] || limit.quality}
+                </span>
+              </p>
+            )}
+          </div>
+          {limit === null ? (
+            <p className="mt-2 text-[13px] text-text-secondary">The limit could not be read just now.</p>
+          ) : limit.limit === 0 ? (
+            <p className="mt-1 font-heading text-2xl font-bold text-ink">Unlimited</p>
+          ) : (
+            <>
+              <div className="mt-1 grid grid-cols-3 gap-3">
+                <div>
+                  <p className="font-heading text-2xl font-bold tabular-nums text-ink">{limit.limit}</p>
+                  <p className="text-[12px] text-text-secondary">people / 24 hours</p>
+                </div>
+                <div>
+                  <p className="font-heading text-2xl font-bold tabular-nums text-ink">{limit.used}</p>
+                  <p className="text-[12px] text-text-secondary">sent in last 24h</p>
+                </div>
+                <div>
+                  <p className={`font-heading text-2xl font-bold tabular-nums ${limit.left === 0 ? 'text-danger' : 'text-success'}`}>
+                    {limit.left}
+                  </p>
+                  <p className="text-[12px] text-text-secondary">left now</p>
+                </div>
+              </div>
+              <div
+                className="mt-3 h-1.5 overflow-hidden rounded-full bg-paper"
+                role="meter"
+                aria-label="Paid limit used"
+                aria-valuemin={0}
+                aria-valuemax={limit.limit}
+                aria-valuenow={Math.min(limit.used, limit.limit)}
+              >
+                <div
+                  className={`h-full rounded-full ${limit.left === 0 ? 'bg-danger' : 'bg-ink'}`}
+                  style={{ width: `${Math.min(100, (limit.used / limit.limit) * 100)}%` }}
+                />
+              </div>
+            </>
+          )}
+          <p className="mt-2 text-[12px] leading-relaxed text-text-secondary">
+            {limit?.problem ||
+              'A paid template can reach this many different people in any 24 hours; the window rolls, so each send frees up a day after it went. Offers never go past it — the rest are held back for a retry. Meta charges only for messages delivered.'}
+          </p>
+        </div>
+
+        <WhatsAppBalance billing={billing} onChange={setBilling} />
       </div>
 
       {/* ── Start from a template ─────────────────────────────────────── */}
@@ -567,7 +705,7 @@ export default function Campaigns() {
                 <TableHead className="w-[46%]">Offer</TableHead>
                 <TableHead className="w-36 text-center">Status</TableHead>
                 <TableHead className="w-56 text-center">Goes out</TableHead>
-                <TableHead className="w-24 text-center">Sent to</TableHead>
+                <TableHead className="w-44 text-center">Delivery</TableHead>
                 <TableHead className="w-24 text-right">Cancel</TableHead>
               </tr>
             </TableHeader>
@@ -609,6 +747,11 @@ export default function Campaigns() {
                               Everyone else: template “{campaign.template_name}”
                             </p>
                           )}
+                          {campaign.retry_of > 0 && (
+                            <p className="mt-0.5 text-[12px] leading-snug text-text-secondary">
+                              Retry of offer #{campaign.retry_of}, to the contacts it missed
+                            </p>
+                          )}
                         </div>
                       </button>
                     </TableCell>
@@ -627,7 +770,46 @@ export default function Campaigns() {
                     </TableCell>
 
                     <TableCell className="text-center tabular-nums text-text-secondary">
-                      {campaign.status === 'sent' ? campaign.total_sent : '—'}
+                      {campaign.status === 'sent' || campaign.status === 'sending' ? (
+                        <button
+                          type="button"
+                          onClick={() => setReport(campaign)}
+                          aria-label={`Delivery report for “${headline(campaign)}”`}
+                          className="group inline-flex flex-col items-center gap-0.5 rounded-lg px-2 py-1 hover:bg-paper"
+                        >
+                          {campaign.delivery ? (
+                            <>
+                              <span className="text-[13px] text-ink">
+                                <span className="font-medium text-success">{campaign.delivery.delivered}</span> of{' '}
+                                {campaign.delivery.sent} delivered
+                              </span>
+                              {campaign.delivery.paid_delivered > 0 && billing && (
+                                <span className="text-[12px] text-text-secondary">
+                                  ≈ {rupees(campaign.delivery.paid_delivered * billing.rate)} charged
+                                </span>
+                              )}
+                              {(campaign.delivery.failed > 0 || campaign.delivery.skipped > 0) && (
+                                <span className="text-[12px]">
+                                  {campaign.delivery.failed > 0 && (
+                                    <span className="text-danger">{campaign.delivery.failed} failed</span>
+                                  )}
+                                  {campaign.delivery.failed > 0 && campaign.delivery.skipped > 0 && ' · '}
+                                  {campaign.delivery.skipped > 0 && (
+                                    <span className="text-warning">{campaign.delivery.skipped} held</span>
+                                  )}
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            <span className="text-[13px]">Sent to {campaign.total_sent}</span>
+                          )}
+                          <span className="inline-flex items-center gap-1 text-[11px] text-text-secondary group-hover:text-primary">
+                            <FileBarChart className="size-3" /> Report
+                          </span>
+                        </button>
+                      ) : (
+                        '—'
+                      )}
                     </TableCell>
 
                     <TableCell className="text-right">
@@ -688,6 +870,18 @@ export default function Campaigns() {
           )}
         </Card>
       </Reveal>
+
+      <OfferContacts refreshKey={refreshKey} />
+
+      <DeliveryReport
+        campaign={report}
+        onClose={() => setReport(null)}
+        onRetried={() => {
+          load(true);
+          loadLimit();
+          loadBilling(true);
+        }}
+      />
 
       {/* ── Composer ────────────────────────────────────────────────────── */}
 
@@ -843,8 +1037,75 @@ export default function Campaigns() {
                     <div className="space-y-2">
                       <p className="text-[12px] leading-relaxed text-text-secondary">
                         People in the last 24 hours get this offer free. Every other subscribed contact gets an
-                        approved WhatsApp marketing template with this photo, and Meta charges for each one.
+                        approved WhatsApp marketing template with this photo, and Meta charges for each one
+                        delivered.
                       </p>
+                      {audience && limit && (
+                        <div className="space-y-2 rounded-lg border border-border bg-paper px-3 py-3 text-[12px] leading-relaxed">
+                          <p className="text-body-text">
+                            Paid: <span className="font-medium tabular-nums text-ink">{audience.subscribed - audience.reachable}</span>{' '}
+                            contacts need the template. Today’s limit has{' '}
+                            <span className="font-medium tabular-nums text-ink">
+                              {limit.left < 0 ? 'no cap' : limit.left}
+                            </span>{' '}
+                            left of {limit.limit === 0 ? 'unlimited' : limit.limit}. Contacts who have not had an offer
+                            yet go first.
+                          </p>
+                          <div className="flex flex-wrap items-center gap-2">
+                            <Label htmlFor="max-paid" className="text-[12px]">
+                              Send the paid template to at most
+                            </Label>
+                            <Input
+                              id="max-paid"
+                              type="number"
+                              min={1}
+                              max={Number.isFinite(paidLeftOf(limit)) ? paidLeftOf(limit) : undefined}
+                              inputMode="numeric"
+                              className="h-8 w-24"
+                              placeholder={String(
+                                Math.min(audience.subscribed - audience.reachable, paidLeftOf(limit)),
+                              )}
+                              value={maxPaid}
+                              onChange={(e) => setMaxPaid(e.target.value)}
+                              aria-invalid={!!errors.maxPaid}
+                            />
+                            <span className="text-text-secondary">people</span>
+                          </div>
+                          {paidPlan && billing && (
+                            <div className="grid grid-cols-3 gap-2 border-t border-border pt-2">
+                              <div>
+                                <p className="font-medium tabular-nums text-ink">{paidPlan.count}</p>
+                                <p className="text-text-secondary">paid sends</p>
+                              </div>
+                              <div>
+                                <p className="font-medium tabular-nums text-ink">up to {rupees(paidPlan.cost)}</p>
+                                <p className="text-text-secondary">at {rupees(billing.rate, 4)} each, if all arrive</p>
+                              </div>
+                              <div>
+                                <p
+                                  className={`font-medium tabular-nums ${
+                                    paidPlan.after != null && paidPlan.after < 0 ? 'text-danger' : 'text-ink'
+                                  }`}
+                                >
+                                  {paidPlan.after != null ? rupees(paidPlan.after) : '—'}
+                                </p>
+                                <p className="text-text-secondary">
+                                  {paidPlan.after != null ? 'balance after, at least' : 'enter the balance to see this'}
+                                </p>
+                              </div>
+                            </div>
+                          )}
+                          {paidPlan?.held > 0 && (
+                            <p className="text-warning">
+                              {paidPlan.held} more need the template but are over the limit. They are held back and
+                              shown in the report, ready for a retry.
+                            </p>
+                          )}
+                          {errors.maxPaid && (
+                            <p role="alert" className="text-danger">{errors.maxPaid}</p>
+                          )}
+                        </div>
+                      )}
                       {waTemplates.loading ? (
                         <p className="text-[12px] text-text-secondary">Loading your templates…</p>
                       ) : waTemplates.error ? (

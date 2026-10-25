@@ -98,6 +98,12 @@ export const getCampaigns = (params) => api.get('/campaigns', { params });
 export const createCampaign = (data) => api.post('/campaigns', data);
 export const deleteCampaign = (id) => api.delete(`/campaigns/${id}`);
 export const getCampaignAnalytics = (id) => api.get(`/campaigns/${id}/analytics`);
+export const getCampaignRecipients = (id) => api.get(`/campaigns/${id}/recipients`);
+export const retryCampaign = (id) => api.post(`/campaigns/${id}/retry`);
+export const getMessagingLimit = () => api.get('/messaging-limit');
+export const getOfferContacts = () => api.get('/offer-contacts');
+export const getBilling = (fresh = false) => api.get('/billing', { params: fresh ? { fresh: 1 } : {} });
+export const setMetaBalance = (amount) => api.post('/billing/balance', { amount });
 // Approved marketing templates on the WhatsApp account, for reaching
 // contacts outside the free 24-hour window.
 export const getWhatsAppTemplates = () => api.get('/whatsapp-templates');
