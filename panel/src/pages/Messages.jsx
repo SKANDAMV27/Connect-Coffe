@@ -237,12 +237,17 @@ try {
 
 };
 
-const filteredContacts = contacts.filter(c =>
+// People who wrote in come first, latest reply on top. Sorting on the last
+// message either way put everyone a broadcast went to above the replies.
+const lastReply = (c) => (c.last_incoming_at ? new Date(c.last_incoming_at).getTime() : 0);
+const filteredContacts = contacts
+.filter(c =>
 (c.name || '')
 .toLowerCase()
 .includes(searchTerm.toLowerCase()) ||
 c.phone.includes(searchTerm)
-);
+)
+.sort((a, b) => lastReply(b) - lastReply(a));
 
 return ( <div className="flex h-full overflow-hidden rounded-xl border border-border bg-white shadow-card">
 <Modal
